@@ -1,0 +1,101 @@
+name: objstore
+
+x-worker: &worker
+  build: ./worker
+  image: objstore-worker
+  depends_on:
+    controller:
+      condition: service_healthy
+  stop_grace_period: 5s
+  healthcheck: &healthcheck
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
+services:
+  controller:
+    build: ./controller
+    image: objstore-controller
+    container_name: controller
+    hostname: controller
+    ports:
+      - "8000:8000"
+    environment:
+      CHUNK_SIZE_BYTES: "1048576"
+      REPLICATION_FACTOR: "2"
+      HEARTBEAT_INTERVAL_S: "3"
+      WORKER_TIMEOUT_S: "10"
+      REPAIR_GRACE_S: "15"
+      REPAIR_INTERVAL_S: "5"
+      STARTUP_GRACE_S: "20"
+    volumes:
+      - controller-data:/data
+    stop_grace_period: 5s
+    healthcheck: *healthcheck
+
+  worker1:
+    <<: *worker
+    container_name: worker1
+    hostname: worker1
+    environment:
+      WORKER_ID: worker1
+      CONTROLLER_URL: http://controller:8000
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - worker1-data:/data
+
+  worker2:
+    <<: *worker
+    container_name: worker2
+    hostname: worker2
+    environment:
+      WORKER_ID: worker2
+      CONTROLLER_URL: http://controller:8000
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - worker2-data:/data
+
+  worker3:
+    <<: *worker
+    container_name: worker3
+    hostname: worker3
+    environment:
+      WORKER_ID: worker3
+      CONTROLLER_URL: http://controller:8000
+    ports:
+      - "127.0.0.1:8003:8000"
+    volumes:
+      - worker3-data:/data
+
+  worker4:
+    <<: *worker
+    container_name: worker4
+    hostname: worker4
+    environment:
+      WORKER_ID: worker4
+      CONTROLLER_URL: http://controller:8000
+    ports:
+      - "127.0.0.1:8004:8000"
+    volumes:
+      - worker4-data:/data
+
+  # One-off command-line client:  docker compose run --rm client <command>
+  client:
+    build: ./client
+    image: objstore-client
+    profiles: ["tools"]
+    environment:
+      OBJSTORE_URL: http://controller:8000
+    volumes:
+      - ./demo/work:/work
+
+volumes:
+  controller-data:
+  worker1-data:
+  worker2-data:
+  worker3-data:
+  worker4-data:
