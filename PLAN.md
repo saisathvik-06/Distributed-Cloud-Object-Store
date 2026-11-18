@@ -1,6 +1,6 @@
 # Mini Distributed Cloud Object Store — Implementation Plan
 
-**Status:** plan only. No code has been written.
+**Status:** implemented. All phases are complete and the six required demonstrations pass; see `README.md` for usage and `DEMO.md` for the runbook. This file is kept as the design record. Differences from the plan as written: the demo helper functions are named `Invoke-Client` and `Get-ClientJson`, `demo/run_all.ps1` runs all six demonstrations, the client has an extra `sha256` command, and demos 5 and 6 accept `-QuickRestart` and `-BothCopies` variants.
 **Source:** professor's assignment PDF, "Cloud Computing — Infrastructure Project: Mini Distributed Cloud Object Store".
 **Written:** 2026-11-16.
 
