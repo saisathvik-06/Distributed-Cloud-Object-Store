@@ -26,7 +26,7 @@ into 1 MB chunks and keeping two copies of every chunk on different storage work
   +---------+ +---------+ +---------+ +---------+
 ```
 
-Clients only ever talk to the controller and never learn where chunks are stored.
+Clients upload and download through the controller. Metadata identifies replica workers without exposing their addresses.
 
 ## What it does
 
@@ -38,7 +38,7 @@ Clients only ever talk to the controller and never learn where chunks are stored
 | Metadata | Name, size, content type, created and modified times, SHA-256 checksum, chunk count, chunk locations, plus custom key-value metadata |
 | Worker failure | Heartbeats every 3 s; a worker silent for 10 s is marked DEAD. Reads fail over to the other copy |
 | Restoring replication | After a 15 s grace period, lost copies are re-created on other workers. When the worker returns, surplus copies are trimmed back to exactly 2 |
-| Data integrity | SHA-256 per chunk, checked by the worker and again by the controller on every read. A corrupt copy is never returned; it is replaced from the valid copy |
+| Data integrity | Fresh SHA-256 verification on reads, periodic scrubbing and reconciliation. Replica pruning verifies surviving copies first |
 | Persistence | Workers and the controller keep their data on named Docker volumes |
 
 ## Prerequisites
@@ -158,7 +158,7 @@ Every error is JSON in one shape:
 
 | Status | When |
 |---|---|
-| 400 | Missing `file`, invalid metadata, invalid paging values, PATCH body not a flat JSON object |
+| 400 | Missing `file`, invalid metadata, invalid paging values, PATCH body not a JSON object |
 | 404 | Unknown or malformed Object ID, unknown route |
 | 409 | PATCH or DELETE while the object is already being deleted |
 | 500 | Unexpected internal error |
@@ -210,7 +210,13 @@ Set in `docker-compose.yml` as environment variables of the controller.
 | `REPAIR_GRACE_S` | 15 | Wait after a worker dies before re-creating its copies |
 | `REPAIR_INTERVAL_S` | 5 | How often the repair loop runs |
 | `STARTUP_GRACE_S` | 20 | No repairs right after the controller starts |
-| `MAX_OBJECT_SIZE_BYTES` | 2147483648 | Largest accepted upload |
+| `MAX_OBJECT_SIZE_BYTES` | 0 | Optional upload size limit; 0 means no extra application limit |
+| `MAX_METADATA_KEYS` | 0 | Optional total metadata key limit; checked after PATCH merge |
+| `MAX_METADATA_BYTES` | 0 | Optional total serialized UTF-8 metadata size limit |
+| `SCRUB_INTERVAL_S` | 30 | Periodically verify stored bytes even without downloads |
+| `RECONCILE_INTERVAL_S` | 30 | Repeat inventory reconciliation and orphan cleanup |
+| `DELETE_RETRY_INTERVAL_S` | 5 | Retry durable cleanup jobs |
+| `ORPHAN_MIN_AGE_S` | 60 | Minimum age before deleting an unknown chunk |
 
 ## How it works
 
@@ -219,19 +225,31 @@ hashes each chunk, and writes it to two workers in parallel. If a worker fails, 
 When every chunk has two confirmed copies, one database transaction marks the object `COMMITTED`.
 If two copies cannot be obtained, everything written is removed and the client gets 503.
 
-**Download.** Chunks are fetched in order. Each one is hashed and compared with the controller's metadata before
-it is sent to the client. A copy that is corrupt, missing or unreachable is skipped and the other copy is used.
+**Download.** All chunks are fetched in order, verified against their authoritative checksums, and spooled to a
+temporary file. The complete object checksum and size are checked before sending response headers. An unavailable
+later chunk therefore returns JSON 503 rather than a partial 200. Memory stays bounded by the chunk size; the
+controller needs temporary disk space for each concurrent download. Once prepared, a download remains valid even
+if the object is deleted. The spool is closed after streaming or cancellation.
 
 **Failure detection.** A worker that has not sent a heartbeat for 10 seconds is marked DEAD.
 A DEAD worker must register again, which always triggers reconciliation.
 
-**Repair loop.** Every 5 seconds (or immediately when something is detected) the controller checks every chunk:
-corrupt copies are overwritten from a healthy copy, missing copies are re-created on another worker once the
-grace period has passed, and surplus copies are deleted.
+**Repair loop.** Every 5 seconds (or when woken), inspect replica state. Every 30 seconds, also scrub actual
+bytes even for apparently healthy chunks. All reachable replicas are verified before repairing or pruning a chunk.
+Missing/corrupt copies are restored from verified bytes. Surplus copies are deleted only after two other copies
+have been verified. With no valid source, preserve the remaining files and report the chunk unavailable.
 
-**Reconciliation.** When a worker registers, the controller compares the worker's real chunk list with its metadata:
-unknown chunks (from deleted objects) are removed, matching chunks are adopted, and recorded copies that are
-missing from the disk are scheduled for re-creation.
+**Reconciliation.** Runs on registration and every 30 seconds. Inventory is only a hint: actual bytes are verified
+before adoption. Recently written unknown files are initially preserved and revisited later. Object lifecycle locks
+coordinate reconciliation, upload, verified download preparation, repair and deletion.
+
+**Deletion.** The controller atomically records cleanup jobs for all registered workers before deleting object
+metadata. Jobs survive controller restarts and are retried until physical deletion succeeds, including when an
+offline worker returns. API deletion makes an object immediately unavailable; offline physical cleanup is eventual.
+
+**Metadata.** Any valid JSON object is accepted, including nested values and upload-time nulls. PATCH merges top-level
+keys; a top-level null deletes that key. Non-finite numbers and invalid Unicode are rejected. Optional limits are
+applied to the merged metadata transactionally. Empty binary objects are supported.
 
 **Controller restart.** Metadata is reloaded from SQLite, workers re-register automatically, interrupted uploads
 are purged and interrupted deletions are finished.
@@ -253,10 +271,30 @@ DEMO.md           demonstration runbook
 ## Known limitations
 
 - The controller is a single point of failure. The assignment specifies exactly one controller.
-- Corruption is detected when a chunk is read (by a download or a repair), not by a periodic background scan.
 - If both copies of a chunk are lost or corrupted, the object cannot be recovered and downloads return 503.
-- A download that loses its last valid copy after the response has started is aborted mid-stream;
-  the client detects this from the short byte count and the checksum.
-- Uploads are buffered to a temporary file on the controller before chunking, so the controller needs
-  temporary disk space equal to the upload size.
+- Upload parsing and verified downloads use temporary disk space on the controller. Concurrent large transfers
+  require sufficient disk capacity; optional upload limits can be configured.
+- Per-object coordination is process-local. Run exactly one controller process (as configured in Docker).
+- SHA-256 detects damaged bytes but cannot recover a chunk when no valid copy remains.
 - There is no authentication or TLS; the system is meant to run locally.
+
+## Automated verification
+
+Run the dependency-free backend and real-disk regression tests:
+
+```bash
+python3 -m unittest discover -s tests -p test_core.py -v
+```
+
+Run the complete isolated Docker suite (host requires Python 3.10+ and Docker Compose v2):
+
+```bash
+python3 tests/run_docker.py
+```
+
+This builds the pinned images, runs backend and actual ASGI API tests inside a container, then runs 15 integration
+scenarios against one controller and four workers. It uses a unique Compose project, dynamically assigned localhost
+ports, and disposable volumes. The ordinary `objstore` deployment is untouched. Test containers and volumes are
+removed afterward; `--keep` preserves them for debugging. Logs/results go to `test-results/`.
+
+See [TESTING.md](TESTING.md) for coverage, local verification results, and remaining environment limitations.

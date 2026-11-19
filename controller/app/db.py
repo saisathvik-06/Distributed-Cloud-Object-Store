@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS workers (
 
 CREATE INDEX IF NOT EXISTS idx_objects_state ON objects(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_replicas_worker ON replicas(worker_id);
+
+-- Independent of object rows: physical cleanup must survive metadata deletion/restart.
+CREATE TABLE IF NOT EXISTS pending_deletions (
+    chunk_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    PRIMARY KEY (chunk_id, worker_id)
+);
 """
 
 

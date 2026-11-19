@@ -15,10 +15,12 @@ import re
 import shutil
 import time
 import uuid
+import threading
+from functools import wraps
 
 # <uuid>-<5 digit index>. Validated before the ID is ever used in a file path.
 CHUNK_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-\d{5}$"
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-\d{5,}$"
 )
 
 
@@ -46,8 +48,17 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class ChunkStore:
     def __init__(self, data_dir: str, max_chunk_bytes: int):
+        self._lock = threading.RLock()
         self.chunks_dir = os.path.join(data_dir, "chunks")
         self.tmp_dir = os.path.join(data_dir, "tmp")
         self.max_chunk_bytes = max_chunk_bytes
@@ -64,7 +75,7 @@ class ChunkStore:
                 pass
 
     def _paths(self, chunk_id: str) -> tuple[str, str]:
-        if not CHUNK_ID_RE.match(chunk_id):
+        if not CHUNK_ID_RE.fullmatch(chunk_id):
             raise InvalidChunkId(chunk_id)
         base = os.path.join(self.chunks_dir, chunk_id)
         return base + ".chunk", base + ".meta"
@@ -75,7 +86,11 @@ class ChunkStore:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, final_path)
+        try:
+            os.replace(tmp_path, final_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     @staticmethod
     def _read_meta(meta_path: str) -> dict | None:
@@ -87,6 +102,7 @@ class ChunkStore:
             return None
 
     # -- operations --------------------------------------------------------
+    @locked
     def put(self, chunk_id: str, data: bytes, expected_sha256: str | None) -> tuple[str, bool]:
         """Store a chunk. Returns (sha256, already_existed)."""
         chunk_path, meta_path = self._paths(chunk_id)
@@ -101,6 +117,7 @@ class ChunkStore:
         self._atomic_write(meta_path, json.dumps(meta).encode("utf-8"))
         return actual, existed
 
+    @locked
     def get(self, chunk_id: str) -> tuple[bytes, str]:
         """Read a chunk and verify it against the sidecar. Returns (data, sha256)."""
         chunk_path, meta_path = self._paths(chunk_id)
@@ -117,6 +134,7 @@ class ChunkStore:
             raise ChunkCorrupt(chunk_id)
         return data, actual
 
+    @locked
     def delete(self, chunk_id: str) -> bool:
         """Delete a chunk. Returns False when it was already absent."""
         chunk_path, meta_path = self._paths(chunk_id)
@@ -129,6 +147,7 @@ class ChunkStore:
                 pass
         return existed
 
+    @locked
     def inventory(self) -> list[dict]:
         """Everything on disk, as recorded by the sidecars (no re-hashing)."""
         items = []
@@ -137,7 +156,7 @@ class ChunkStore:
                 if not entry.name.endswith(".chunk"):
                     continue
                 chunk_id = entry.name[: -len(".chunk")]
-                if not CHUNK_ID_RE.match(chunk_id):
+                if not CHUNK_ID_RE.fullmatch(chunk_id):
                     continue
                 try:
                     stat = entry.stat()
@@ -155,6 +174,7 @@ class ChunkStore:
         items.sort(key=lambda c: c["chunk_id"])
         return items
 
+    @locked
     def stats(self) -> dict:
         count = 0
         used = 0

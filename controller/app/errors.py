@@ -4,11 +4,6 @@
 """
 import logging
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
-
 log = logging.getLogger("controller.errors")
 
 
@@ -24,14 +19,18 @@ def not_found(object_id: str) -> ApiError:
     return ApiError(404, "OBJECT_NOT_FOUND", f"Object {object_id} does not exist")
 
 
-def error_response(status: int, code: str, message: str) -> JSONResponse:
+def error_response(status: int, code: str, message: str):
+    from fastapi.responses import JSONResponse
     return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
 
 
 _HTTP_CODES = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}
 
 
-def install(app: FastAPI) -> None:
+def install(app) -> None:
+    from fastapi import Request
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
     @app.exception_handler(ApiError)
     async def _api_error(request: Request, exc: ApiError):
         return error_response(exc.status, exc.code, exc.message)

@@ -19,10 +19,13 @@ REPAIR_INTERVAL_S = _float("REPAIR_INTERVAL_S", 5)           # how often the rep
 STARTUP_GRACE_S = _float("STARTUP_GRACE_S", 20)              # no repairs right after the controller starts
 WORKER_CONNECT_TIMEOUT_S = _float("WORKER_CONNECT_TIMEOUT_S", 2)
 WORKER_TRANSFER_TIMEOUT_S = _float("WORKER_TRANSFER_TIMEOUT_S", 15)
-MAX_OBJECT_SIZE = _int("MAX_OBJECT_SIZE_BYTES", 2 * 1024 * 1024 * 1024)
+MAX_OBJECT_SIZE = _int("MAX_OBJECT_SIZE_BYTES", 0)          # 0: no assignment-specific size limit
 ORPHAN_MIN_AGE_S = _float("ORPHAN_MIN_AGE_S", 60)            # reconciliation never deletes younger files
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DB_PATH = os.path.join(DATA_DIR, "metadata.db")
 
-MAX_METADATA_KEYS = 64
-MAX_METADATA_BYTES = 16 * 1024
+MAX_METADATA_KEYS = _int("MAX_METADATA_KEYS", 0)           # 0: unlimited
+MAX_METADATA_BYTES = _int("MAX_METADATA_BYTES", 0)
+SCRUB_INTERVAL_S = _float("SCRUB_INTERVAL_S", 30)
+RECONCILE_INTERVAL_S = _float("RECONCILE_INTERVAL_S", 30)
+DELETE_RETRY_INTERVAL_S = _float("DELETE_RETRY_INTERVAL_S", 5)

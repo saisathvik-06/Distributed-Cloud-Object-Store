@@ -1,17 +1,18 @@
 """Client-facing REST API: /api/v1/objects."""
-import json
 import mimetypes
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from .context import Context
 from .deletion import purge_object
 from .download import open_download
 from .errors import ApiError, not_found
 from .repository import run_db
-from .schemas import normalise_object_id, object_document, validate_custom_metadata
+from .schemas import normalise_object_id, object_document
+from .metadata import parse_json, validate_custom_metadata
 from .upload import store_object
 
 router = APIRouter(prefix="/api/v1/objects", tags=["objects"])
@@ -39,11 +40,12 @@ async def _document(ctx: Context, object_id: str) -> dict:
 def _clean_name(filename: str | None) -> str:
     # The name is only ever stored as text, never used as a path.
     name = (filename or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    name = "".join(c for c in name if ord(c) >= 32 and ord(c) != 127)
     return name or "unnamed"
 
 
 def _content_type(declared: str | None, name: str) -> str:
-    if declared and declared != "application/octet-stream":
+    if declared:
         return declared
     guessed, _ = mimetypes.guess_type(name)
     return guessed or "application/octet-stream"
@@ -57,17 +59,22 @@ async def upload_object(
 ):
     ctx = _ctx(request)
     custom: dict = {}
-    if metadata is not None and metadata.strip():
+    # Read the form value too: FastAPI can turn an explicitly empty field into None.
+    metadata = (await request.form()).get("metadata", metadata)
+    if metadata is not None:
         try:
-            custom = json.loads(metadata)
-        except ValueError:
+            custom = parse_json(metadata)
+        except (ValueError, TypeError, RecursionError):
             raise ApiError(400, "INVALID_METADATA", "The 'metadata' field is not valid JSON") from None
         validate_custom_metadata(custom, allow_null=False)
 
     name = _clean_name(file.filename)
-    object_id = await store_object(ctx, file, name, _content_type(file.content_type, name), custom)
-    document = await _document(ctx, object_id)
-    return JSONResponse(status_code=201, content=document, headers={"Location": f"/api/v1/objects/{object_id}"})
+    stored = await store_object(ctx, file, name, _content_type(file.content_type, name), custom)
+    # A concurrent client may delete a just-listed object before this response is
+    # serialized. Return the committed creation snapshot rather than querying again.
+    document = object_document(stored.metadata, stored.chunks, ctx.membership)
+    return JSONResponse(status_code=201, content=document,
+                        headers={"Location": f"/api/v1/objects/{stored.object_id}"})
 
 
 @router.get("")
@@ -96,12 +103,16 @@ async def download_object(object_id: str, request: Request):
         "ETag": f'"{obj["checksum"]}"',
         "X-Object-Checksum": obj["checksum"],
     }
-    return StreamingResponse(body, media_type=obj["content_type"], headers=headers)
+    return StreamingResponse(body.body(), media_type=obj["content_type"], headers=headers,
+                             background=BackgroundTask(body.close))
 
 
 @router.get("/{object_id}/metadata")
 async def get_metadata(object_id: str, request: Request):
-    return await _document(_ctx(request), _object_id(object_id))
+    ctx = _ctx(request)
+    object_id = _object_id(object_id)
+    async with ctx.object_lock(object_id):
+        return await _document(ctx, object_id)
 
 
 @router.patch("/{object_id}/metadata")
@@ -109,27 +120,29 @@ async def update_metadata(object_id: str, request: Request):
     ctx = _ctx(request)
     object_id = _object_id(object_id)
     try:
-        patch = json.loads(await request.body() or b"null")
-    except ValueError:
+        patch = parse_json(await request.body() or b"null")
+    except (ValueError, TypeError, RecursionError):
         raise ApiError(400, "INVALID_REQUEST", "Request body is not valid JSON") from None
     validate_custom_metadata(patch, allow_null=True)
 
-    outcome = await run_db(ctx.repo.patch_metadata, object_id, patch)
-    if outcome == "not_found":
-        raise not_found(object_id)
-    if outcome == "deleting":
-        raise ApiError(409, "OBJECT_BEING_DELETED", f"Object {object_id} is being deleted")
-    return await _document(ctx, object_id)
+    async with ctx.object_lock(object_id):
+        outcome = await run_db(ctx.repo.patch_metadata, object_id, patch)
+        if outcome == "not_found":
+            raise not_found(object_id)
+        if outcome == "deleting":
+            raise ApiError(409, "OBJECT_BEING_DELETED", f"Object {object_id} is being deleted")
+        return await _document(ctx, object_id)
 
 
 @router.delete("/{object_id}", status_code=204)
 async def delete_object(object_id: str, request: Request):
     ctx = _ctx(request)
     object_id = _object_id(object_id)
-    outcome = await run_db(ctx.repo.begin_delete, object_id)
-    if outcome == "not_found":
-        raise not_found(object_id)
-    if outcome == "deleting":
-        raise ApiError(409, "OBJECT_BEING_DELETED", f"Deletion of object {object_id} is already in progress")
-    await purge_object(ctx, object_id)
+    async with ctx.object_lock(object_id):
+        outcome = await run_db(ctx.repo.begin_delete, object_id)
+        if outcome == "not_found":
+            raise not_found(object_id)
+        if outcome == "deleting":
+            raise ApiError(409, "OBJECT_BEING_DELETED", f"Deletion of object {object_id} is already in progress")
+        await purge_object(ctx, object_id, lock_held=True)
     return Response(status_code=204)

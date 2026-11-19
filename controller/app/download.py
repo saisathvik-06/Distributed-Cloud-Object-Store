@@ -4,14 +4,15 @@ Invariant: the controller never hands out bytes that fail the SHA-256 check
 against its own metadata. A bad or unreachable copy is skipped and the other
 replica is used; bad copies are flagged for the repair loop.
 """
+import tempfile
 import hashlib
 import logging
 import random
 
 from .context import Context
-from .errors import ApiError
+from .errors import ApiError, not_found
 from .repository import run_db
-from .worker_client import ChunkCorruptOnWorker, ChunkMissing, WorkerError
+from .worker_errors import ChunkCorruptOnWorker, ChunkMissing, WorkerError
 
 log = logging.getLogger("controller.download")
 
@@ -65,37 +66,55 @@ def _unavailable(obj: dict, index: int) -> ApiError:
     )
 
 
-async def open_download(ctx: Context, obj: dict):
-    """Prepare a download. Returns an async byte iterator.
+class PreparedDownload:
+    def __init__(self, spool):
+        self.spool = spool
 
-    Anything that can be known before the response starts is checked here, so
-    it can still be reported with a clean 503:
-      * every chunk has at least one healthy copy on an alive worker;
-      * chunk 0 is fetched and verified before any header is sent.
-    """
-    chunks = await run_db(ctx.repo.get_chunks, obj["object_id"])
-    for chunk in chunks:
-        if not any(r["state"] == "HEALTHY" and ctx.membership.is_alive(r["worker_id"]) for r in chunk["replicas"]):
-            raise _unavailable(obj, chunk["chunk_index"])
-    first = None
-    if chunks:
+    async def close(self):
+        await run_db(self.spool.close)
+
+    async def body(self):
         try:
-            first, _ = await fetch_verified_chunk(ctx, chunks[0])
-        except NoValidReplica:
-            raise _unavailable(obj, 0) from None
+            while True:
+                block = await run_db(self.spool.read, 1024 * 1024)
+                if not block:
+                    break
+                yield block
+        finally:
+            await self.close()
 
-    async def body():
-        if first is not None:
-            yield first
-        for chunk in chunks[1:]:
-            try:
-                data, _ = await fetch_verified_chunk(ctx, chunk)
-            except NoValidReplica:
-                # Headers are already sent, so the status cannot change. Abort the
-                # connection: the client sees fewer bytes than Content-Length.
-                log.error("DOWNLOAD_ABORTED object %s: chunk %s has no valid copy",
-                          obj["object_id"], chunk["chunk_id"])
-                raise RuntimeError("no valid replica while streaming") from None
-            yield data
 
-    return body()
+async def open_download(ctx: Context, obj: dict) -> PreparedDownload:
+    """Verify the complete object to temporary disk before sending HTTP headers.
+
+    Memory stays bounded by chunk size. Deletion waits until the snapshot is
+    complete, then may proceed while the independent spool is sent to the client.
+    """
+    spool = tempfile.TemporaryFile(mode="w+b")
+    try:
+        async with ctx.object_lock(obj["object_id"]):
+            current = await run_db(ctx.repo.get_object, obj["object_id"])
+            if current is None:
+                raise not_found(obj["object_id"])
+            chunks = await run_db(ctx.repo.get_chunks, obj["object_id"])
+            if len(chunks) != current["chunk_count"]:
+                raise _unavailable(current, 0)
+            digest = hashlib.sha256()
+            total = 0
+            for index, chunk in enumerate(chunks):
+                if chunk["chunk_index"] != index:
+                    raise _unavailable(current, index)
+                try:
+                    data, _ = await fetch_verified_chunk(ctx, chunk)
+                except NoValidReplica:
+                    raise _unavailable(current, index) from None
+                digest.update(data)
+                total += len(data)
+                await run_db(spool.write, data)
+            if total != current["size"] or digest.hexdigest() != current["checksum"]:
+                raise ApiError(503, "DATA_UNAVAILABLE", "Object metadata or checksum is inconsistent")
+            await run_db(spool.seek, 0)
+        return PreparedDownload(spool)
+    except BaseException:
+        spool.close()
+        raise

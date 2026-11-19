@@ -12,7 +12,8 @@ from fastapi import FastAPI, Request
 
 from . import api_admin, api_internal, api_objects, config, db, errors
 from .context import Context
-from .deletion import purge_object
+from .deletion import purge_object, run_cleanup
+from .reconcile import run_reconciliation
 from .membership import Membership
 from .repair import RepairManager
 from .repository import Repository, run_db
@@ -53,6 +54,8 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(membership.run_detector()),
         asyncio.create_task(ctx.repair.run()),
+        asyncio.create_task(run_cleanup(ctx)),
+        asyncio.create_task(run_reconciliation(ctx)),
     ]
     if uploading or deleting:
         ctx.spawn(_finish_interrupted_work(ctx, uploading, deleting))
@@ -63,7 +66,8 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        for task in tasks + list(ctx.background):
+        tasks += list(ctx.background)
+        for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await ctx.workers.close()

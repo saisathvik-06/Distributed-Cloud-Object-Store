@@ -6,3 +6,5 @@ __pycache__/
 .idea/
 demo/work/*
 !demo/work/.gitkeep
+
+test-results/

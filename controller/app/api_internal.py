@@ -18,7 +18,7 @@ WORKER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 @router.post("/register")
 async def register_worker(body: RegisterRequest, request: Request):
     ctx: Context = request.app.state.ctx
-    if not WORKER_ID_RE.match(body.worker_id) or not body.address.startswith(("http://", "https://")):
+    if not WORKER_ID_RE.fullmatch(body.worker_id) or not body.address.startswith(("http://", "https://")):
         raise ApiError(400, "INVALID_REQUEST", "worker_id or address is malformed")
     address = body.address.rstrip("/")
     await run_db(ctx.repo.upsert_worker, body.worker_id, address)

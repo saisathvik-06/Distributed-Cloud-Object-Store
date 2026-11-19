@@ -10,13 +10,21 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from .metadata import validate_custom_metadata
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 async def run_db(fn, *args, **kwargs):
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Do not release a lifecycle lock while its DB write still runs in a thread.
+        await task
+        raise
 
 
 class Repository:
@@ -59,6 +67,7 @@ class Repository:
 
     # -- object lifecycle --------------------------------------------------
     def create_object(self, object_id: str, name: str, content_type: str, custom_metadata: dict) -> None:
+        validate_custom_metadata(custom_metadata)
         now = utc_now()
         with self._tx() as c:
             c.execute(
@@ -80,7 +89,7 @@ class Repository:
         with self._tx() as c:
             c.execute(
                 "UPDATE objects SET size = ?, chunk_count = ?, checksum = ?, state = 'COMMITTED', "
-                "created_at = ?, modified_at = ? WHERE object_id = ?",
+                "created_at = ?, modified_at = ? WHERE object_id = ? AND state = 'UPLOADING'",
                 (size, chunk_count, checksum, now, now, object_id),
             )
 
@@ -98,7 +107,7 @@ class Repository:
         """Chunks in order, each with its replica list."""
         with self._lock:
             chunk_rows = self._conn.execute(
-                "SELECT chunk_id, chunk_index, size, checksum FROM chunks WHERE object_id = ? ORDER BY chunk_index",
+                "SELECT chunk_id, object_id, chunk_index, size, checksum FROM chunks WHERE object_id = ? ORDER BY chunk_index",
                 (object_id,),
             ).fetchall()
             replica_rows = self._conn.execute(
@@ -139,6 +148,7 @@ class Repository:
                     merged.pop(key, None)
                 else:
                     merged[key] = value
+            validate_custom_metadata(merged)
             c.execute(
                 "UPDATE objects SET custom_metadata = ?, modified_at = ? WHERE object_id = ?",
                 (json.dumps(merged), utc_now(), object_id),
@@ -161,6 +171,37 @@ class Repository:
         with self._tx() as c:
             c.execute("DELETE FROM objects WHERE object_id = ?", (object_id,))
 
+    def queue_object_deletion(self, object_id: str) -> None:
+        """Atomically remember every possible physical copy before removing metadata."""
+        with self._tx() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO pending_deletions (chunk_id, worker_id) "
+                "SELECT c.chunk_id, w.worker_id FROM chunks c CROSS JOIN workers w WHERE c.object_id = ?",
+                (object_id,),
+            )
+            c.execute("DELETE FROM objects WHERE object_id = ?", (object_id,))
+
+    def pending_deletions(self) -> list[dict]:
+        return [dict(r) for r in self._query("SELECT * FROM pending_deletions")]
+
+    def finish_chunk_deletion(self, chunk_id: str, worker_id: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM pending_deletions WHERE chunk_id = ? AND worker_id = ?", (chunk_id, worker_id))
+
+    def get_chunk(self, chunk_id: str) -> dict | None:
+        with self._lock:
+            rows = self._query(
+                "SELECT c.*, o.state AS object_state FROM chunks c JOIN objects o USING(object_id) WHERE chunk_id = ?",
+                (chunk_id,),
+            )
+            if not rows:
+                return None
+            chunk = dict(rows[0])
+            chunk["replicas"] = [dict(r) for r in self._query(
+                "SELECT worker_id, state FROM replicas WHERE chunk_id = ?", (chunk_id,)
+            )]
+            return chunk
+
     def object_ids_in_state(self, state: str) -> list[str]:
         return [r["object_id"] for r in self._query("SELECT object_id FROM objects WHERE state = ?", (state,))]
 
@@ -173,7 +214,8 @@ class Repository:
         with self._tx() as c:
             cur = c.execute(
                 "INSERT OR REPLACE INTO replicas (chunk_id, worker_id, state, created_at) "
-                "SELECT ?, ?, 'HEALTHY', ? WHERE EXISTS (SELECT 1 FROM chunks WHERE chunk_id = ?)",
+                "SELECT ?, ?, 'HEALTHY', ? WHERE EXISTS (SELECT 1 FROM chunks c "
+                "JOIN objects o USING(object_id) WHERE c.chunk_id = ? AND o.state != 'DELETING')",
                 (chunk_id, worker_id, utc_now(), chunk_id),
             )
             return cur.rowcount > 0

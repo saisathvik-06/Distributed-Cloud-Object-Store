@@ -2,20 +2,9 @@
 import httpx
 
 from . import config
+from .worker_errors import WorkerError, ChunkMissing, ChunkCorruptOnWorker
 
 CHECKSUM_HEADER = "X-Chunk-Checksum"
-
-
-class WorkerError(Exception):
-    """The worker could not be reached or answered unexpectedly."""
-
-
-class ChunkMissing(WorkerError):
-    """The worker answered, and it does not have the chunk."""
-
-
-class ChunkCorruptOnWorker(WorkerError):
-    """The worker's own read check found the chunk damaged."""
 
 
 class WorkerClient:
@@ -41,7 +30,11 @@ class WorkerClient:
             raise WorkerError(f"{address}: {type(exc).__name__}") from exc
         if resp.status_code not in (200, 201):
             raise WorkerError(f"{address}: PUT returned {resp.status_code}")
-        if resp.json().get("checksum") != checksum:
+        try:
+            stored_checksum = resp.json().get("checksum")
+        except (ValueError, AttributeError):
+            raise WorkerError(f"{address}: invalid PUT acknowledgement") from None
+        if stored_checksum != checksum:
             raise WorkerError(f"{address}: stored checksum differs from the one sent")
 
     async def get_chunk(self, address: str, chunk_id: str) -> bytes:
@@ -77,4 +70,10 @@ class WorkerClient:
             raise WorkerError(f"{address}: {type(exc).__name__}") from exc
         if resp.status_code != 200:
             raise WorkerError(f"{address}: inventory returned {resp.status_code}")
-        return resp.json()["chunks"]
+        try:
+            chunks = resp.json()["chunks"]
+            if not isinstance(chunks, list) or not all(isinstance(c, dict) and isinstance(c.get("chunk_id"), str) for c in chunks):
+                raise ValueError("invalid inventory")
+            return chunks
+        except (ValueError, KeyError, TypeError):
+            raise WorkerError(f"{address}: invalid inventory") from None

@@ -1,11 +1,9 @@
 """Request validation and response shapes for the client API."""
-import json
 import uuid
 
 from pydantic import BaseModel
 
 from . import config
-from .errors import ApiError
 from .membership import Membership
 
 
@@ -32,27 +30,6 @@ def normalise_object_id(raw: str) -> str | None:
         return None
     return str(parsed) if str(parsed) == raw.lower() else None
 
-
-def validate_custom_metadata(value, allow_null: bool) -> dict:
-    """Custom metadata is a flat JSON object: string keys; string, number or boolean values.
-
-    With `allow_null` (PATCH), a null value means "remove this key".
-    """
-    if not isinstance(value, dict):
-        raise ApiError(400, "INVALID_METADATA", "Custom metadata must be a JSON object of key-value pairs")
-    if len(value) > config.MAX_METADATA_KEYS:
-        raise ApiError(400, "INVALID_METADATA", f"Custom metadata may have at most {config.MAX_METADATA_KEYS} keys")
-    for key, item in value.items():
-        if not isinstance(key, str) or not key.strip() or len(key) > 128:
-            raise ApiError(400, "INVALID_METADATA", "Metadata keys must be non-empty strings of at most 128 characters")
-        if item is None:
-            if not allow_null:
-                raise ApiError(400, "INVALID_METADATA", f"Metadata value for '{key}' must not be null")
-        elif isinstance(item, (dict, list)) or not isinstance(item, (str, int, float, bool)):
-            raise ApiError(400, "INVALID_METADATA", f"Metadata value for '{key}' must be a string, number or boolean")
-    if len(json.dumps(value).encode("utf-8")) > config.MAX_METADATA_BYTES:
-        raise ApiError(400, "INVALID_METADATA", f"Custom metadata may not exceed {config.MAX_METADATA_BYTES} bytes")
-    return value
 
 
 def chunk_status(replicas: list[dict], membership: Membership) -> str:
