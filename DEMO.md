@@ -98,8 +98,7 @@ Scripts: `demo\04_metadata.ps1` · `demo/04_metadata.sh`
 
 Scripts: `demo\05_worker_failure.ps1` · `demo/05_worker_failure.sh`
 
-Timeline with the default settings: the worker is declared DEAD about 10 s after it stops, and its copies
-are re-created about 15 s after that.
+With the default settings, the controller marks a worker DEAD after about 10 seconds without a heartbeat. Once the 15-second grace period expires, a subsequent repair pass can restore missing replicas.
 
 | Step | What happens | What to point out |
 |---|---|---|
@@ -123,7 +122,7 @@ Scripts: `demo\06_data_integrity.ps1` · `demo/06_data_integrity.sh`
 | 6.1 | Upload a 3.5 MB object | Note chunk 1 and the two workers holding it |
 | 6.2 | Bytes inside one copy of chunk 1 are overwritten with `docker exec ... dd` | The file's SHA-256 on disk no longer matches the expected value |
 | 6.3 | The object is downloaded and compared until the corruption is detected | Every download still matches the original; the log shows `CORRUPTION_DETECTED`. It is caught either by a download or by the background scan (every 30 s), whichever comes first |
-| 6.4 | Wait for the repair loop | The log shows `REPAIRED`. The damaged copy is replaced: a fresh copy is written from the valid one (often on a different worker) and the damaged file is deleted, so the chunk again has two copies that pass the checksum |
+| 6.4 | Wait for the repair loop | The controller can overwrite the damaged copy or create a replacement on another worker. The demo passes when the cluster reports full replication and zero corrupt replicas, and both current copies of the affected chunk match its expected SHA-256 |
 
 Variant: also corrupt both copies of chunk 0 by adding `-BothCopies` (PowerShell) or `--both-copies` (bash).
 The download returns `503 DATA_UNAVAILABLE`: the system refuses rather than return corrupt data.

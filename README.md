@@ -44,7 +44,7 @@ Clients upload and download through the controller. Metadata identifies replica 
 ## Prerequisites
 
 - Docker Desktop (or Docker Engine) with Docker Compose v2.
-- Nothing else. Python is not needed on the host; everything runs in containers.
+- The object store and containerized client run with Docker and Compose v2. The full integration test runner also requires Python 3.10+ on the host.
 
 ## Build and start
 
@@ -128,7 +128,7 @@ bash objstore.sh verify <object_id> big.bin
 
 ## REST API
 
-Base URL: `http://localhost:8000`. In PowerShell use `curl.exe`, because `curl` is an alias for a different command.
+Base URL: `http://localhost:8000`. The examples below use Bash and `curl`. In Windows PowerShell, use `curl.exe` to invoke the curl executable.
 
 | Method | Endpoint | Purpose | Success |
 |---|---|---|---|
@@ -147,19 +147,20 @@ curl -F "file=@photo.jpg" -F 'metadata={"owner":"sai","album":"trip"}' http://lo
 ```
 
 ```bash
-curl -o copy.jpg http://localhost:8000/api/v1/objects/<object_id>
+OBJECT_ID='paste-the-ID-returned-by-upload'
+curl -o copy.jpg "http://localhost:8000/api/v1/objects/$OBJECT_ID"
 ```
 
 ```bash
-curl http://localhost:8000/api/v1/objects/<object_id>/metadata
+curl "http://localhost:8000/api/v1/objects/$OBJECT_ID/metadata"
 ```
 
 ```bash
-curl -X PATCH -H "Content-Type: application/json" -d '{"album":"goa","owner":null}' http://localhost:8000/api/v1/objects/<object_id>/metadata
+curl -X PATCH -H "Content-Type: application/json" -d '{"album":"goa","owner":null}' "http://localhost:8000/api/v1/objects/$OBJECT_ID/metadata"
 ```
 
 ```bash
-curl -X DELETE http://localhost:8000/api/v1/objects/<object_id>
+curl -X DELETE "http://localhost:8000/api/v1/objects/$OBJECT_ID"
 ```
 
 Interactive API documentation is served at `http://localhost:8000/docs`.
@@ -253,12 +254,11 @@ Set in `docker-compose.yml` as environment variables of the controller.
 **Upload.** The controller creates the object in state `UPLOADING`, reads the file 1 MB at a time,
 hashes each chunk, and writes it to two workers in parallel. If a worker fails, another is tried.
 When every chunk has two confirmed copies, one database transaction marks the object `COMMITTED`.
-If two copies cannot be obtained, everything written is removed and the client gets 503.
+If two copies cannot be obtained, the upload fails with HTTP 503. The controller cleans up partial data and retries outstanding deletions.
 
 **Download.** All chunks are fetched in order, verified against their authoritative checksums, and spooled to a
 temporary file. The complete object checksum and size are checked before sending response headers. An unavailable
-later chunk therefore returns JSON 503 rather than a partial 200. Memory stays bounded by the chunk size; the
-controller needs temporary disk space for each concurrent download. Once prepared, a download remains valid even
+later chunk therefore returns JSON 503 rather than a partial 200. The controller processes file data one chunk at a time and uses temporary disk space for each concurrent download. Once prepared, a download remains valid even
 if the object is deleted. The spool is closed after streaming or cancellation.
 
 **Failure detection.** A worker that has not sent a heartbeat for 10 seconds is marked DEAD.
@@ -292,7 +292,7 @@ are purged and interrupted deletions are finished.
 | Object ID is a random UUID | Unique without coordination and safe in URLs; two files with the same name never clash |
 | Chunk ID is `<object_id>-<5-digit index>` | Unique, readable on disk during the demo, and keeps the order; the index is also stored as a number |
 | SHA-256 per chunk and per object | The chunk hash finds which copy is bad; the object hash proves a download matches the upload |
-| Chunks are written once and never modified | A returning worker can never hold an out-of-date version of a chunk, only a valid, extra or orphaned one |
+| Object contents are immutable after upload | Repair can rewrite a physical replica with the original verified bytes |
 | An object is visible only after every chunk has two confirmed copies | Half-written objects never appear in a list or download |
 | Least-loaded placement with a random tie-break | Spreads chunks evenly, and the same two workers are not always paired |
 | 15 s grace period before re-copying | A worker that restarts quickly does not trigger a full copy of its data |
@@ -315,7 +315,7 @@ are purged and interrupted deletions are finished.
 | A chunk file is deleted from a disk | Treated as a lost copy and re-created | 2 copies |
 | A worker dies during an upload | That chunk goes to another worker | Upload succeeds if 2 or more workers are alive |
 | An object is deleted while a worker is down | Cleanup jobs are kept and retried; the leftover files are removed when the worker returns | No leftover files |
-| The controller restarts | Metadata reloads from SQLite; workers re-register on their own; interrupted uploads and deletions are finished | Consistent |
+| The controller restarts | The controller reloads metadata, discards incomplete uploads, and resumes pending deletions. Workers re-register automatically | Consistent |
 | The controller is down | Nothing works until it restarts (single controller by design) | Recovers on restart |
 
 ## Assumptions
