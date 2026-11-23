@@ -83,8 +83,14 @@ docker compose down -v
 The client runs as a one-off container. Files are read from and written to `demo/work/`
 (mounted at `/work` inside the container), so use file names relative to that folder.
 
-On Windows PowerShell there is a short wrapper: `.\objstore.ps1 <command>`.
-On any shell: `docker compose run --rm client <command>`.
+Short wrappers:
+
+- Windows PowerShell: `.\objstore.ps1 <command>`
+- macOS / Linux (bash): `bash objstore.sh <command>`
+- Any shell: `docker compose run --rm client <command>`
+
+If PowerShell refuses to run `.\objstore.ps1` ("running scripts is disabled"), run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in that window; it only affects that window.
 
 | Command | What it does |
 |---|---|
@@ -108,6 +114,16 @@ Example session (PowerShell):
 .\objstore.ps1 list
 .\objstore.ps1 info <object_id>
 .\objstore.ps1 verify <object_id> big.bin
+```
+
+The same session on macOS / Linux (bash):
+
+```bash
+bash objstore.sh gen 5.5MB big.bin
+bash objstore.sh upload big.bin --meta owner=sai
+bash objstore.sh list
+bash objstore.sh info <object_id>
+bash objstore.sh verify <object_id> big.bin
 ```
 
 ## REST API
@@ -180,16 +196,30 @@ Worker ports are published on localhost (8001 to 8004) only so they can be inspe
 
 ## Demonstrations
 
-`DEMO.md` is the step-by-step runbook for the six required demonstrations. Scripts are in `demo/`:
+`DEMO.md` is the step-by-step runbook for the six required demonstrations. Each script comes in two
+versions that do exactly the same thing: `.ps1` for Windows PowerShell and `.sh` for macOS / Linux.
+Start Docker Desktop first and run them from the project folder.
+
+Windows (PowerShell):
 
 ```powershell
-.\demo\reset.ps1                    # clean cluster (erases stored data)
-.\demo\run_all.ps1                  # all six, pausing between steps
-.\demo\05_worker_failure.ps1        # a single demonstration
+powershell -ExecutionPolicy Bypass -File .\demo\reset.ps1                  # clean cluster (erases stored data)
+powershell -ExecutionPolicy Bypass -File .\demo\run_all.ps1                # all six, pausing between steps
+powershell -ExecutionPolicy Bypass -File .\demo\05_worker_failure.ps1      # a single demonstration
 ```
 
-Add `-NoPause` to run without stopping. If scripts are blocked, start PowerShell with
-`powershell -ExecutionPolicy Bypass -File .\demo\run_all.ps1`.
+Add `-NoPause` to run without stopping. Optional variants: `-QuickRestart` (demo 5) and `-BothCopies` (demo 6).
+
+macOS / Linux (bash):
+
+```bash
+bash demo/reset.sh                  # clean cluster (erases stored data)
+bash demo/run_all.sh                # all six, pausing between steps
+bash demo/05_worker_failure.sh      # a single demonstration
+```
+
+Add `--no-pause` to run without stopping. Optional variants: `--quick-restart` (demo 5) and `--both-copies` (demo 6).
+The bash scripts need only Docker and `curl`, and work with the bash 3.2 that ships with macOS.
 
 To watch the system react live, keep this running in a second terminal:
 
@@ -254,17 +284,66 @@ applied to the merged metadata transactionally. Empty binary objects are support
 **Controller restart.** Metadata is reloaded from SQLite, workers re-register automatically, interrupted uploads
 are purged and interrupted deletions are finished.
 
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| All data flows through the controller | The client never needs worker locations (as the brief requires), and every byte is checked in one place before it is returned |
+| Object ID is a random UUID | Unique without coordination and safe in URLs; two files with the same name never clash |
+| Chunk ID is `<object_id>-<5-digit index>` | Unique, readable on disk during the demo, and keeps the order; the index is also stored as a number |
+| SHA-256 per chunk and per object | The chunk hash finds which copy is bad; the object hash proves a download matches the upload |
+| Chunks are written once and never modified | A returning worker can never hold an out-of-date version of a chunk, only a valid, extra or orphaned one |
+| An object is visible only after every chunk has two confirmed copies | Half-written objects never appear in a list or download |
+| Least-loaded placement with a random tie-break | Spreads chunks evenly, and the same two workers are not always paired |
+| 15 s grace period before re-copying | A worker that restarts quickly does not trigger a full copy of its data |
+| Liveness measured only on the controller's clock | No dependence on clocks agreeing across containers |
+| SQLite on a volume for metadata | Transactional and survives restarts, with no extra database service |
+| Named Docker volumes, not bind mounts | Avoids file locking and slow I/O from folders synced by tools such as OneDrive |
+| Exactly one controller process | Membership state and background tasks live in memory |
+
+## Failure scenarios
+
+| Scenario | What the system does | End state |
+|---|---|---|
+| One worker stops | Reads use the other copy; new uploads use the other three workers; after the grace period the lost copies are re-created | 2 copies of everything, on 3 workers |
+| That worker returns after the repair | It registers and is reconciled; the extra copies are trimmed | Exactly 2 copies |
+| That worker returns within the grace period | Reconciled only; nothing is copied | 2 copies |
+| Two workers stop | Chunks with a surviving copy are served and re-copied onto the 2 survivors; chunks whose both copies were on the stopped pair return 503 | Partly available until one returns |
+| Three workers stop | Chunks on the survivor can still be read; uploads return 503 | Under-replicated until workers return |
+| A stored chunk is corrupted | The checksum mismatch is caught on a read or by the background scan; the valid copy is served and a fresh copy replaces the damaged one | 2 valid copies |
+| Both copies of a chunk are corrupted | 503; corrupt bytes are never returned | The object must be uploaded again |
+| A chunk file is deleted from a disk | Treated as a lost copy and re-created | 2 copies |
+| A worker dies during an upload | That chunk goes to another worker | Upload succeeds if 2 or more workers are alive |
+| An object is deleted while a worker is down | Cleanup jobs are kept and retried; the leftover files are removed when the worker returns | No leftover files |
+| The controller restarts | Metadata reloads from SQLite; workers re-register on their own; interrupted uploads and deletions are finished | Consistent |
+| The controller is down | Nothing works until it restarts (single controller by design) | Recovers on restart |
+
+## Assumptions
+
+The brief leaves a few points open; this is how we read them.
+
+- "1 MB" means 1,048,576 bytes. It is the `CHUNK_SIZE_BYTES` setting, so it is easy to change.
+- 409 Conflict is returned for a PATCH or DELETE on an object whose deletion is already in progress. Duplicate file
+  names are allowed, because the Object ID identifies an object.
+- `GET /internal/workers/{worker_id}/chunks` is served by the worker, which is the only source of truth about what
+  is on its own disk.
+- Controller metadata is persisted too, so `docker compose down` followed by `up` keeps every object.
+- A malformed Object ID returns 404, the same as an unknown one.
+
 ## Project layout
 
 ```
-controller/app/   main, config, errors, db, repository, schemas,
+controller/app/   main, config, context, errors, db, repository, schemas, metadata,
                   api_objects, api_internal, api_admin,
-                  membership, placement, upload, download, deletion, repair, reconcile, worker_client
+                  membership, placement, upload, download, deletion, repair, reconcile,
+                  worker_client, worker_errors
 worker/app/       main, config, storage, registration
 client/           objstore_cli.py
-demo/             six demonstration scripts, reset.ps1, run_all.ps1
+demo/             six demonstration scripts in .ps1 (Windows) and .sh (macOS / Linux), reset, run_all
+tests/            unit, API and isolated Docker integration tests
+objstore.ps1      client wrapper for Windows PowerShell
+objstore.sh       client wrapper for macOS / Linux
 docker-compose.yml
-PLAN.md           design and implementation plan
 DEMO.md           demonstration runbook
 ```
 
@@ -286,6 +365,21 @@ Run the dependency-free backend and real-disk regression tests:
 python3 -m unittest discover -s tests -p test_core.py -v
 ```
 
+No Python on your computer? Run the unit and API tests inside the controller image instead
+(after `docker compose build`).
+
+macOS / Linux (bash):
+
+```bash
+docker run --rm -v "$PWD:/project:ro" -w /project objstore-controller python -m unittest discover -s tests
+```
+
+Windows (PowerShell):
+
+```powershell
+docker run --rm -v "${PWD}:/project:ro" -w /project objstore-controller python -m unittest discover -s tests
+```
+
 Run the complete isolated Docker suite (host requires Python 3.10+ and Docker Compose v2):
 
 ```bash
@@ -296,5 +390,3 @@ This builds the pinned images, runs backend and actual ASGI API tests inside a c
 scenarios against one controller and four workers. It uses a unique Compose project, dynamically assigned localhost
 ports, and disposable volumes. The ordinary `objstore` deployment is untouched. Test containers and volumes are
 removed afterward; `--keep` preserves them for debugging. Logs/results go to `test-results/`.
-
-See [TESTING.md](TESTING.md) for coverage, local verification results, and remaining environment limitations.

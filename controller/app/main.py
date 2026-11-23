@@ -32,7 +32,7 @@ async def _finish_interrupted_work(ctx: Context, uploading: list[str], deleting:
     await asyncio.sleep(config.STARTUP_GRACE_S)
     for object_id in uploading:
         log.info("RECOVERY purging interrupted upload %s", object_id)
-        await purge_object(ctx, object_id, every_alive_worker=True)
+        await purge_object(ctx, object_id)
     for object_id in deleting:
         log.info("RECOVERY finishing interrupted deletion of %s", object_id)
         await purge_object(ctx, object_id)

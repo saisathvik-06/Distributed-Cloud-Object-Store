@@ -1,37 +1,60 @@
 # Demonstration runbook
 
 Covers the six demonstrations required by the assignment. Each has a script in `demo/` that prints
-every step, checks the result, and ends with `PASS` or `FAIL`.
+every step, checks the result, and ends with `PASS` or `FAIL`. Every script exists twice and does the same
+thing in both versions: `.ps1` for Windows PowerShell and `.sh` for macOS / Linux.
 
 ## Before you start
 
-1. Start from a clean cluster (this erases stored data):
+Open **Docker Desktop** and wait until it shows "Engine running". Then open a terminal in the project folder.
 
-   ```powershell
-   .\demo\reset.ps1
-   ```
+**1. Start from a clean cluster** (this erases stored data).
 
-2. In a **second terminal**, follow the controller log so the audience sees events as they happen:
+Windows (PowerShell):
 
-   ```powershell
-   docker compose logs -f controller
-   ```
+```powershell
+powershell -ExecutionPolicy Bypass -File .\demo\reset.ps1
+```
 
-3. Run the demonstrations one at a time, or all together:
+macOS / Linux (bash):
 
-   ```powershell
-   .\demo\run_all.ps1
-   ```
+```bash
+bash demo/reset.sh
+```
 
-Each script pauses for Enter between steps. Add `-NoPause` to run straight through.
-If PowerShell blocks scripts, run them as `powershell -ExecutionPolicy Bypass -File .\demo\<script>.ps1`.
+**2. In a second terminal, follow the controller log** so the audience sees events as they happen
+(same command on every system):
+
+```bash
+docker compose logs -f controller
+```
+
+**3. Run all six demonstrations.**
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\demo\run_all.ps1
+```
+
+macOS / Linux (bash):
+
+```bash
+bash demo/run_all.sh
+```
+
+Each script pauses for Enter between steps. To run straight through, add `-NoPause` (PowerShell) or
+`--no-pause` (bash). To run a single demonstration, use its own script, for example
+`powershell -ExecutionPolicy Bypass -File .\demo\05_worker_failure.ps1` or `bash demo/05_worker_failure.sh`.
 
 The whole set takes about three minutes without pauses. Demonstration 5 is the longest (about one minute)
 because it waits for real timeouts.
 
 ---
 
-## 1. Object storage: `.\demo\01_object_storage.ps1`
+## 1. Object storage
+
+Scripts: `demo\01_object_storage.ps1` · `demo/01_object_storage.sh`
 
 | Step | What happens | What to point out |
 |---|---|---|
@@ -40,7 +63,9 @@ because it waits for real timeouts.
 | 1.3 | Download, `GET /api/v1/objects/{id}` | The client never sees worker addresses |
 | 1.4 | SHA-256 of original, download and stored checksum | All three are identical |
 
-## 2. Chunking and distribution: `.\demo\02_chunking_distribution.ps1`
+## 2. Chunking and distribution
+
+Scripts: `demo\02_chunking_distribution.ps1` · `demo/02_chunking_distribution.sh`
 
 | Step | What happens | What to point out |
 |---|---|---|
@@ -48,7 +73,9 @@ because it waits for real timeouts.
 | 2.2 | Object info lists the chunks | 6 chunks: five of 1,048,576 bytes and a final one of 524,288 bytes, in order, each with its own ID |
 | 2.3 | `ls` of `/data/chunks` inside every worker | The chunk files really are spread over the workers' volumes |
 
-## 3. Replication: `.\demo\03_replication.ps1`
+## 3. Replication
+
+Scripts: `demo\03_replication.ps1` · `demo/03_replication.sh`
 
 | Step | What happens | What to point out |
 |---|---|---|
@@ -56,7 +83,9 @@ because it waits for real timeouts.
 | 3.3 | Each worker is asked directly what it has on disk (`GET /internal/workers/{id}/chunks`) | Independent evidence, not just the controller's word |
 | 3.4 | Metadata and disks are compared chunk by chunk | They agree, and every chunk has exactly 2 copies |
 
-## 4. Metadata: `.\demo\04_metadata.ps1`
+## 4. Metadata
+
+Scripts: `demo\04_metadata.ps1` · `demo/04_metadata.sh`
 
 | Step | What happens | What to point out |
 |---|---|---|
@@ -65,7 +94,9 @@ because it waits for real timeouts.
 | 4.3 | `PATCH .../metadata`: change `owner`, add `status`, remove `course` | Only a small JSON body is sent |
 | 4.4 | Before and after comparison | `modified_at` advanced; checksum, chunks and `created_at` unchanged, so nothing was re-uploaded |
 
-## 5. Worker failure: `.\demo\05_worker_failure.ps1`
+## 5. Worker failure
+
+Scripts: `demo\05_worker_failure.ps1` · `demo/05_worker_failure.sh`
 
 Timeline with the default settings: the worker is declared DEAD about 10 s after it stops, and its copies
 are re-created about 15 s after that.
@@ -80,19 +111,21 @@ are re-created about 15 s after that.
 | 5.6 | `docker start worker2` | The worker registers again and is reconciled; the log shows `SURPLUS_COPY_REMOVED` as third copies are trimmed |
 | 5.7 | Cluster status and object info | AFTER: 4 workers ALIVE, every chunk has exactly 2 copies |
 
-Variant: `.\demo\05_worker_failure.ps1 -QuickRestart` restarts the worker inside the grace period,
-showing that its copies are simply re-validated and nothing is copied.
+Variant: restart the worker inside the grace period, showing that its copies are simply re-validated and
+nothing is copied: add `-QuickRestart` (PowerShell) or `--quick-restart` (bash).
 
-## 6. Data integrity: `.\demo\06_data_integrity.ps1`
+## 6. Data integrity
+
+Scripts: `demo\06_data_integrity.ps1` · `demo/06_data_integrity.sh`
 
 | Step | What happens | What to point out |
 |---|---|---|
 | 6.1 | Upload a 3.5 MB object | Note chunk 1 and the two workers holding it |
 | 6.2 | Bytes inside one copy of chunk 1 are overwritten with `docker exec ... dd` | The file's SHA-256 on disk no longer matches the expected value |
-| 6.3 | The object is downloaded and compared | Every download still matches the original; the log shows `CORRUPTION_DETECTED` |
+| 6.3 | The object is downloaded and compared until the corruption is detected | Every download still matches the original; the log shows `CORRUPTION_DETECTED`. It is caught either by a download or by the background scan (every 30 s), whichever comes first |
 | 6.4 | Wait for the repair loop | The log shows `REPAIRED`. The damaged copy is replaced: a fresh copy is written from the valid one (often on a different worker) and the damaged file is deleted, so the chunk again has two copies that pass the checksum |
 
-Variant: `.\demo\06_data_integrity.ps1 -BothCopies` then corrupts both copies of chunk 0.
+Variant: also corrupt both copies of chunk 0 by adding `-BothCopies` (PowerShell) or `--both-copies` (bash).
 The download returns `503 DATA_UNAVAILABLE`: the system refuses rather than return corrupt data.
 
 ---
@@ -100,6 +133,9 @@ The download returns `503 DATA_UNAVAILABLE`: the system refuses rather than retu
 ## Doing it by hand
 
 The same demonstrations with individual commands, in case a step needs repeating.
+
+Windows (PowerShell). If PowerShell refuses to run `.\objstore.ps1`, first run
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass`, which only affects the current window.
 
 ```powershell
 .\objstore.ps1 gen 5.5MB big.bin
@@ -113,7 +149,23 @@ docker start worker2
 .\objstore.ps1 cluster
 ```
 
-Corrupt one copy of a chunk (take the chunk ID and worker from `info`):
+macOS / Linux (bash):
+
+```bash
+bash objstore.sh gen 5.5MB big.bin
+bash objstore.sh upload big.bin --meta owner=sai
+bash objstore.sh info <object_id>
+bash objstore.sh cluster
+docker stop worker2
+bash objstore.sh cluster
+bash objstore.sh verify <object_id> big.bin
+docker start worker2
+bash objstore.sh cluster
+```
+
+Corrupt one copy of a chunk (take the chunk ID and a worker holding it from `info`).
+
+Windows (PowerShell):
 
 ```powershell
 docker exec worker1 sh -c "printf 'CORRUPTED' | dd of=/data/chunks/<chunk_id>.chunk bs=1 seek=4096 conv=notrunc"
@@ -121,7 +173,16 @@ docker exec worker1 sh -c "printf 'CORRUPTED' | dd of=/data/chunks/<chunk_id>.ch
 docker logs controller --tail 20
 ```
 
+macOS / Linux (bash):
+
+```bash
+docker exec worker1 sh -c "printf 'CORRUPTED' | dd of=/data/chunks/<chunk_id>.chunk bs=1 seek=4096 conv=notrunc"
+bash objstore.sh verify <object_id> big.bin
+docker logs controller --tail 20
+```
+
 A read picks one of the two copies at random, so run `verify` a few times until the damaged copy is hit.
+The background scan also finds it within about 30 seconds even if nothing is downloaded.
 
 ## Log events to look for
 

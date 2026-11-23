@@ -28,8 +28,7 @@ async def retry_deletions(ctx: Context) -> None:
     await asyncio.gather(*(remove(item) for item in pending))
 
 
-async def purge_object(ctx: Context, object_id: str, every_alive_worker: bool = False,
-                       *, lock_held: bool = False) -> None:
+async def purge_object(ctx: Context, object_id: str, *, lock_held: bool = False) -> None:
     # Include ALL registered workers: a PUT may have succeeded before its reply
     # or replica record was lost. Queue entries survive removal of object rows.
     if lock_held:
