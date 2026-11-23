@@ -76,7 +76,7 @@ are re-created about 15 s after that.
 | 5.2 | `docker stop worker2` | The log shows `WORKER_DEAD worker2` after 10 s without a heartbeat |
 | 5.3 | Cluster status and object info | DURING: the controller reports which chunks are under-replicated; "Replication factor is NOT maintained" |
 | 5.4 | Download and compare | The object is still served, from the surviving copies |
-| 5.5 | Wait for the grace period | The log shows `RE_REPLICATED ...`; replication factor 2 is restored on the three remaining workers |
+| 5.5 | Wait for the grace period | The log shows `REPAIRED ...` lines; replication factor 2 is restored on the three remaining workers |
 | 5.6 | `docker start worker2` | The worker registers again and is reconciled; the log shows `SURPLUS_COPY_REMOVED` as third copies are trimmed |
 | 5.7 | Cluster status and object info | AFTER: 4 workers ALIVE, every chunk has exactly 2 copies |
 
@@ -90,7 +90,7 @@ showing that its copies are simply re-validated and nothing is copied.
 | 6.1 | Upload a 3.5 MB object | Note chunk 1 and the two workers holding it |
 | 6.2 | Bytes inside one copy of chunk 1 are overwritten with `docker exec ... dd` | The file's SHA-256 on disk no longer matches the expected value |
 | 6.3 | The object is downloaded and compared | Every download still matches the original; the log shows `CORRUPTION_DETECTED` |
-| 6.4 | Wait for the repair loop | The log shows `REPAIRED_IN_PLACE`; the file's SHA-256 on disk is correct again |
+| 6.4 | Wait for the repair loop | The log shows `REPAIRED`. The damaged copy is replaced: a fresh copy is written from the valid one (often on a different worker) and the damaged file is deleted, so the chunk again has two copies that pass the checksum |
 
 Variant: `.\demo\06_data_integrity.ps1 -BothCopies` then corrupts both copies of chunk 0.
 The download returns `503 DATA_UNAVAILABLE`: the system refuses rather than return corrupt data.
@@ -128,11 +128,9 @@ A read picks one of the two copies at random, so run `verify` a few times until 
 | Event | Meaning |
 |---|---|
 | `WORKER_REGISTERED` | A worker joined or rejoined |
-| `RECONCILED` | The worker's disk was compared with the metadata |
 | `WORKER_DEAD` | No heartbeat for the timeout period |
-| `RE_REPLICATED` | A lost copy was re-created on another worker |
+| `REPAIRED` | A missing or damaged copy was re-created from a valid one |
 | `SURPLUS_COPY_REMOVED` | A third copy was trimmed after a worker returned |
 | `CORRUPTION_DETECTED` | A copy failed its SHA-256 check and was skipped |
-| `REPAIRED_IN_PLACE` | A corrupt copy was overwritten from a valid one |
 | `REPLICA_MISSING` | A chunk file had vanished from a worker and will be re-created |
 | `CHUNK_UNAVAILABLE` | No valid copy remains on any available worker |

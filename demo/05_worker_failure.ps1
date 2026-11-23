@@ -37,7 +37,7 @@ if ($QuickRestart) {
     Step "5.5  Restart inside the grace period: docker start $victim"
     docker start $victim
     Wait-Until { $c = Get-Cluster; ($c.alive_workers -eq 4) -and $c.replication.fully_replicated } "$victim to register again and be reconciled"
-    Show-ControllerLog "WORKER_REGISTERED $victim|RECONCILED $victim|RE_REPLICATED|SURPLUS" 4
+    Show-ControllerLog "WORKER_REGISTERED $victim|REPAIRED|SURPLUS_COPY_REMOVED" 4
     Invoke-Client cluster
     Pass "worker returned within the grace period: its copies were re-validated and nothing had to be copied"
     exit 0
@@ -45,7 +45,7 @@ if ($QuickRestart) {
 
 Step "5.5  SELF-HEALING: after the 15 s grace period the lost copies are re-created on other workers"
 Wait-Until { (Get-Cluster).replication.under_replicated -eq 0 } "replication factor 2 to be restored on the remaining workers"
-Show-ControllerLog "RE_REPLICATED" 8
+Show-ControllerLog "REPAIRED" 8
 Invoke-Client cluster
 Invoke-Client info $obj.object_id
 Pass "replication factor restored while $victim is still down"
@@ -54,7 +54,7 @@ Pause-Demo
 Step "5.6  RECOVERY: docker start $victim"
 docker start $victim
 Wait-Until { $c = Get-Cluster; ($c.alive_workers -eq 4) -and ($c.replication.over_replicated -eq 0) -and $c.replication.fully_replicated } "$victim to register, be reconciled, and surplus copies to be trimmed"
-Show-ControllerLog "WORKER_REGISTERED $victim|RECONCILED $victim|SURPLUS_COPY_REMOVED" 10
+Show-ControllerLog "WORKER_REGISTERED $victim|SURPLUS_COPY_REMOVED" 10
 Pause-Demo
 
 Step "5.7  AFTER: all workers ALIVE and every chunk has exactly 2 copies again"
